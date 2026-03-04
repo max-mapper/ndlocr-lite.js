@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NDLOCR-Lite Browser Demo</title>
+    <!-- Load ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <!-- Load js-yaml to parse the template string -->
+    <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+
+    <style>
+      body {
+        font-family: sans-serif;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 20px;
+        line-height: 1.6;
+      }
+      .panel {
+        border: 1px solid #ddd;
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        background: #fafafa;
+      }
+      .controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 20px;
+      }
+      button {
+        padding: 10px 15px;
+        background: #0066cc;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #cccccc;
+        cursor: not-allowed;
+      }
+      #status {
+        font-weight: bold;
+        color: #d9534f;
+        margin-top: 10px;
+      }
+      .preview-container {
+        text-align: center;
+        margin-bottom: 20px;
+      }
+      canvas#imageCanvas {
+        max-width: 100%;
+        max-height: 600px;
+        border: 1px dashed #ccc;
+        display: none;
+        margin: 0 auto;
+      }
+      #legend {
+        display: none;
+        flex-wrap: wrap;
+        gap: 15px;
+        justify-content: center;
+        margin-top: 15px;
+        padding: 15px;
+        background: #fafafa;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 14px;
+      }
+      .legend-swatch {
+        width: 18px;
+        height: 18px;
+        border-radius: 4px;
+        border: 1px solid #999;
+      }
+      pre {
+        background: #1e1e1e;
+        color: #d4d4d4;
+        padding: 15px;
+        border-radius: 6px;
+        overflow-x: auto;
+        max-height: 350px;
+        overflow-y: auto;
+        max-width: 90%;
+      }
+      .split-layout {
+        display: flex;
+        gap: 20px;
+        align-items: flex-start;
+      }
+      .preview-container,
+      .output-container {
+        flex: 1;
+        width: 50%;
+        min-width: 0; /* Prevents large content from breaking the 50% layout */
+      }
+    </style>
+  </head>
+  <body>
+    <h1>NDLOCR-Lite Browser Demo</h1>
+
+    <div class="panel">
+      <p>
+        A JavaScript port of
+        <a href="https://github.com/ndl-lab/ndlocr-lite">ndlocr-lite</a> using
+        onnxruntime-web that can perform OCR on images containing Japanese text.
+        Requires ~150MB .onnx model download.
+      </p>
+
+      <div class="controls">
+        <button id="btnInit">1. Initialize Models</button>
+        <input
+          type="file"
+          id="imageInput"
+          accept="image/png, image/jpeg, image/jpg, image/jp2"
+          disabled
+        />
+        <button id="btnRun" disabled>2. Run OCR</button>
+      </div>
+
+      <div id="status">Status: Waiting to initialize...</div>
+    </div>
+
+    <div class="split-layout">
+      <div class="preview-container">
+        <canvas id="imageCanvas"></canvas>
+        <div id="legend"></div>
+      </div>
+
+      <div class="output-container">
+        <pre id="jsonOutput">// Results will appear here...</pre>
+      </div>
+    </div>
+
+    <script type="module">
+      import { NDLOCR } from "./ocr.js";
+
+      // ==========================================
+      // Mapping Definitions
+      // ==========================================
+      const colorTuples = [
+        [0, 0, 0],
+        [255, 0, 0],
+        [0, 0, 142],
+        [0, 0, 230],
+        [106, 0, 228],
+        [0, 60, 100],
+        [0, 80, 100],
+        [0, 0, 70],
+        [0, 0, 192],
+        [250, 170, 30],
+        [100, 170, 30],
+        [220, 220, 0],
+        [175, 116, 175],
+        [250, 0, 30],
+        [165, 42, 42],
+        [255, 77, 255],
+        [255, 0, 0],
+      ];
+      const colors = colorTuples.map((c) => `rgb(${c[0]}, ${c[1]}, ${c[2]})`);
+
+      const classes = {
+        0: "text_block",
+        1: "line_main",
+        2: "line_caption",
+        3: "line_ad",
+        4: "line_note",
+        5: "line_note_tochu",
+        6: "block_fig",
+        7: "block_ad",
+        8: "block_pillar",
+        9: "block_folio",
+        10: "block_rubi",
+        11: "block_chart",
+        12: "block_eqn",
+        13: "block_cfm",
+        14: "block_eng",
+        15: "block_table",
+        16: "line_title",
+      };
+
+      async function run() {
+        const response = await fetch("./config/NDLmoji.yaml");
+        const yamlString = await response.text();
+
+        // ==========================================
+        // PATHS TO YOUR ONNX MODELS
+        // ==========================================
+        const modelPaths = {
+          deimPath: "./model/deim-s-1024x1024.onnx",
+          parseq30Path:
+            "./model/parseq-ndl-16x256-30-tiny-192epoch-tegaki3.onnx",
+          parseq50Path:
+            "./model/parseq-ndl-16x384-50-tiny-146epoch-tegaki2.onnx",
+          parseq100Path:
+            "./model/parseq-ndl-16x768-100-tiny-165epoch-tegaki2.onnx",
+        };
+
+        // ==========================================
+        // UI LOGIC
+        // ==========================================
+        const ndlOcr = new NDLOCR();
+        const btnInit = document.getElementById("btnInit");
+        const btnRun = document.getElementById("btnRun");
+        const fileInput = document.getElementById("imageInput");
+        const statusEl = document.getElementById("status");
+
+        const imageCanvas = document.getElementById("imageCanvas");
+        const legendEl = document.getElementById("legend");
+        const jsonOutput = document.getElementById("jsonOutput");
+
+        let currentImage = null;
+
+        // Render Legend Dynamically
+        function renderLegend(usedClassIndices) {
+          legendEl.innerHTML = "";
+          if (usedClassIndices.length === 0) {
+            legendEl.style.display = "none";
+            return;
+          }
+          legendEl.style.display = "flex";
+
+          usedClassIndices.forEach((idx) => {
+            const itemDiv = document.createElement("div");
+            itemDiv.className = "legend-item";
+
+            const swatch = document.createElement("div");
+            swatch.className = "legend-swatch";
+            swatch.style.backgroundColor = colors[idx] || "#000";
+
+            const label = document.createElement("span");
+            label.textContent = classes[idx] || `Unknown (${idx})`;
+
+            itemDiv.appendChild(swatch);
+            itemDiv.appendChild(label);
+            legendEl.appendChild(itemDiv);
+          });
+        }
+
+        // File Preview / Canvas Rendering
+        fileInput.addEventListener("change", (e) => {
+          const file = e.target.files[0];
+          if (file) {
+            const url = URL.createObjectURL(file);
+            currentImage = new Image();
+            currentImage.onload = () => {
+              imageCanvas.width = currentImage.width;
+              imageCanvas.height = currentImage.height;
+
+              const ctx = imageCanvas.getContext("2d");
+              ctx.drawImage(currentImage, 0, 0);
+
+              imageCanvas.style.display = "block";
+              legendEl.style.display = "none";
+              btnRun.disabled = false;
+              jsonOutput.textContent = "// Ready to run...";
+
+              URL.revokeObjectURL(url);
+            };
+            currentImage.src = url;
+          } else {
+            imageCanvas.style.display = "none";
+            legendEl.style.display = "none";
+            btnRun.disabled = true;
+          }
+        });
+
+        // Init Models
+        btnInit.addEventListener("click", async () => {
+          try {
+            btnInit.disabled = true;
+            statusEl.textContent =
+              "Status: Parsing Yaml & Downloading Models (This might take a while)...";
+            statusEl.style.color = "#f0ad4e";
+            console.time("init");
+
+            // Parse the Yaml string to get character list
+            const parsedYaml = jsyaml.load(yamlString);
+            const charlist = parsedYaml.model.charset_train;
+
+            // Pass ONNX paths + options
+            await ndlOcr.init({
+              ...modelPaths,
+              charlist: charlist,
+              ortOptions: { executionProviders: ["wasm"] },
+            });
+            console.timeEnd("init");
+
+            statusEl.textContent =
+              "Status: Models initialized successfully! Please select an image.";
+            statusEl.style.color = "#5cb85c";
+            fileInput.disabled = false;
+          } catch (error) {
+            console.error(error);
+            statusEl.textContent =
+              "Status: Error initializing models. Check console logs.";
+            statusEl.style.color = "#d9534f";
+            btnInit.disabled = false;
+          }
+        });
+
+        // Run OCR
+        btnRun.addEventListener("click", async () => {
+          const file = fileInput.files[0];
+          if (!file) return;
+
+          try {
+            btnRun.disabled = true;
+            fileInput.disabled = true;
+            statusEl.textContent =
+              "Status: Running Detection & Recognition Inference...";
+            statusEl.style.color = "#0066cc";
+            jsonOutput.textContent = "// Processing...";
+            console.time("process");
+
+            const results = await ndlOcr.process(file);
+            console.timeEnd("process");
+
+            console.log(results);
+
+            const bestItemsMap = new Map();
+
+            results.contents.forEach((r, index) => {
+              // Only process line_main and line_title
+              if (r.class === "line_main" || r.class === "line_title") {
+                // Convert the bounding box array to a string to use as a unique dictionary key
+                const bboxKey = JSON.stringify(r.boundingBox);
+
+                // Add the original index so we can preserve the reading order later
+                const currentItem = { ...r, originalIndex: index };
+
+                // If we haven't seen this bounding box yet, or if the current confidence is higher, save it
+                if (
+                  !bestItemsMap.has(bboxKey) ||
+                  currentItem.confidence > bestItemsMap.get(bboxKey).confidence
+                ) {
+                  bestItemsMap.set(bboxKey, currentItem);
+                }
+              }
+            });
+
+            // Convert the Map values back to an array
+            const deduplicatedItems = Array.from(bestItemsMap.values());
+
+            // Sort by the original index to preserve the JSON's natural reading order
+            deduplicatedItems.sort((a, b) => a.originalIndex - b.originalIndex);
+
+            // Extract the text and output
+            const lines = deduplicatedItems.map((r) => r.text);
+            jsonOutput.textContent = lines.join("\n");
+
+            var isVertical = false;
+            deduplicatedItems.forEach((r) => {
+              if (r.isVertical) isVertical = true;
+            });
+
+            if (isVertical) jsonOutput.style.writingMode = "vertical-rl";
+
+            statusEl.textContent = "Status: Inference Complete!";
+            statusEl.style.color = "#5cb85c";
+
+            // ----------------------------------------------------
+            // Render Bounding Boxes on Canvas
+            // ----------------------------------------------------
+            if (currentImage && results.contents) {
+              const ctx = imageCanvas.getContext("2d");
+
+              // Clear and redraw base image just in case it's run multiple times
+              ctx.clearRect(0, 0, imageCanvas.width, imageCanvas.height);
+              ctx.drawImage(currentImage, 0, 0);
+
+              const usedClassIndices = new Set();
+
+              // Dynamically adjust line-width so it's visible depending on the image size
+              ctx.lineWidth = Math.max(2, currentImage.width / 400);
+
+              results.contents.forEach((item) => {
+                if (!item.boundingBox) return;
+
+                // NDLOCR sometimes uses [TL, BL, TR, BR].
+                // Safely grab the min and max to draw straight standardized bounds:
+                const xs = item.boundingBox.map((p) => p[0]);
+                const ys = item.boundingBox.map((p) => p[1]);
+
+                const xmin = Math.min(...xs);
+                const xmax = Math.max(...xs);
+                const ymin = Math.min(...ys);
+                const ymax = Math.max(...ys);
+
+                const clsIdx =
+                  item.class_index !== undefined ? item.class_index : 0;
+                usedClassIndices.add(clsIdx);
+
+                ctx.strokeStyle = colors[clsIdx] || "rgb(0,0,0)";
+                ctx.strokeRect(xmin, ymin, xmax - xmin, ymax - ymin);
+              });
+
+              // Construct the legend specific to the classes actually used in this image
+              const sortedUsedClasses = Array.from(usedClassIndices).sort(
+                (a, b) => a - b,
+              );
+              renderLegend(sortedUsedClasses);
+            }
+          } catch (error) {
+            console.error(error);
+            statusEl.textContent =
+              "Status: Error during inference. Check console.";
+            statusEl.style.color = "#d9534f";
+          } finally {
+            btnRun.disabled = false;
+            fileInput.disabled = false;
+          }
+        });
+      }
+
+      run();
+    </script>
+  </body>
+</html>
